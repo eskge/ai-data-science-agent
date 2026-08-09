@@ -47,7 +47,7 @@ def _profile_column(df: pd.DataFrame, col: str) -> Dict[str, Any]:
         "col_type": _classify_column(series),
     }
 
-    if pd.api.types.is_numeric_dtype(series):
+    if pd.api.types.is_numeric_dtype(series) and not pd.api.types.is_bool_dtype(series):
         try:
             desc = series.describe()
         except Exception:
@@ -80,7 +80,7 @@ def _profile_column(df: pd.DataFrame, col: str) -> Dict[str, Any]:
             "q75":      _safe("75%"),
             "skewness": skew_val,
         })
-    elif pd.api.types.is_object_dtype(series) or pd.api.types.is_categorical_dtype(series):
+    elif pd.api.types.is_object_dtype(series) or str(series.dtype) == "category":
         vc = series.value_counts()
         info["top_values"] = vc.head(5).to_dict()
 
@@ -125,14 +125,15 @@ def _classify_column(series: pd.Series) -> str:
 def _find_duplicate_columns(df: pd.DataFrame) -> List[str]:
     dupes = []
     seen = {}
-    # Use a fast hash first (sample), then verify with full column only if hash matches
     for col in df.columns:
         try:
             sample = df[col].fillna("__NA__").astype(str)
-            # Quick fingerprint: hash of first 500 + last 500 + value_counts hash
-            fingerprint = hash((tuple(sample.iloc[:500]), tuple(sample.iloc[-500:]), tuple(sample.value_counts().items())))
+            fingerprint = hash((
+                tuple(sample.iloc[:500]),
+                tuple(sample.iloc[-500:]),
+                tuple(sample.value_counts().items()),
+            ))
             if fingerprint in seen:
-                # Full verification before flagging
                 if (df[col].fillna("__NA__").astype(str) == df[seen[fingerprint]].fillna("__NA__").astype(str)).all():
                     dupes.append(f"{col} == {seen[fingerprint]}")
             else:
@@ -158,19 +159,36 @@ def _detect_quality_issues(df: pd.DataFrame, col_profiles: Dict) -> Dict[str, Li
         elif info["unique_count"] == 2:
             pass  # Binary columns are valid — don't flag as near-constant
         elif info["cardinality_pct"] < 1.0 and info["unique_count"] > 1:
-            flags["near_constant_cols"].append(col)
-        if info["cardinality_pct"] > 95 and info["unique_count"] > 100:
+            # Only flag numeric columns as near-constant — low-cardinality text
+            # columns are legitimate categoricals, NOT near-constant
+            if info["col_type"] in ("numerical", "categorical_numeric"):
+                flags["near_constant_cols"].append(col)
+
+        # High-cardinality detection:
+        # - Text/categorical: flag if >50 unique values (ML encoding challenge)
+        # - Numeric: flag if >95% unique (true ID columns)
+        is_text_col = info["col_type"] in ("text", "high_cardinality_text", "categorical", "potential_datetime")
+        if is_text_col and info["unique_count"] > 50:
             flags["high_cardinality_cols"].append(col)
-            if "id" in col.lower() or "key" in col.lower() or "uuid" in col.lower():
+            if info["cardinality_pct"] > 95 or any(k in col.lower() for k in ("id", "key", "uuid")):
                 flags["potential_id_cols"].append(col)
+        elif not is_text_col and info["cardinality_pct"] > 95 and info["unique_count"] > 20:
+            flags["high_cardinality_cols"].append(col)
+            flags["potential_id_cols"].append(col)
+
         if info["missing_pct"] > 30:
             flags["high_missing_cols"].append(col)
+
         # Detect numeric stored as string
         if info["col_type"] == "text" and info["missing_pct"] < 50:
             sample = df[col].dropna().head(50)
-            numeric_count = pd.to_numeric(sample, errors="coerce").notna().sum()
-            if numeric_count / len(sample) > 0.8:
-                flags["type_mismatch_cols"].append(col)
+            try:
+                numeric_count = pd.to_numeric(sample, errors="coerce").notna().sum()
+                if numeric_count / len(sample) > 0.8:
+                    flags["type_mismatch_cols"].append(col)
+            except Exception:
+                pass
+
         # Potential binary target
         if info["col_type"] in ("categorical", "categorical_numeric") and info["unique_count"] == 2:
             name_lower = col.lower()
@@ -196,8 +214,17 @@ def _detect_outliers(df: pd.DataFrame) -> Dict[str, Any]:
             iqr = q3 - q1
             if iqr == 0:
                 continue
-            iqr_outliers = int(((series < q1 - 1.5 * iqr) | (series > q3 + 1.5 * iqr)).sum())
 
+            # Clamp lower bound to 0 for strictly non-negative columns
+            actual_min = float(series.min())
+            raw_lower = q1 - 1.5 * iqr
+            raw_upper = q3 + 1.5 * iqr
+            if actual_min >= 0:
+                raw_lower = max(raw_lower, 0.0)
+            lower_bound = round(float(raw_lower), 4)
+            upper_bound = round(float(raw_upper), 4)
+
+            iqr_outliers = int(((series < lower_bound) | (series > upper_bound)).sum())
             z_scores = np.abs(stats.zscore(series))
             z_outliers = int((z_scores > 3).sum())
 
@@ -207,8 +234,8 @@ def _detect_outliers(df: pd.DataFrame) -> Dict[str, Any]:
                     "iqr_pct": round(iqr_outliers / len(series) * 100, 2),
                     "zscore_outliers": z_outliers,
                     "zscore_pct": round(z_outliers / len(series) * 100, 2),
-                    "lower_bound": round(float(q1 - 1.5 * iqr), 4),
-                    "upper_bound": round(float(q3 + 1.5 * iqr), 4),
+                    "lower_bound": lower_bound,
+                    "upper_bound": upper_bound,
                 }
         except Exception:
             continue
@@ -225,51 +252,39 @@ def _compute_health_score(df: pd.DataFrame, profile: Dict) -> Dict[str, Any]:
     missing_cells = sum(c["missing_count"] for c in profile["columns"].values())
     missing_pct = missing_cells / max(total_cells, 1) * 100
     if missing_pct == 0:
-        missing_deduct = 0
-        missing_label = "Excellent"
+        missing_deduct, missing_label = 0, "Excellent"
     elif missing_pct < 5:
-        missing_deduct = 5
-        missing_label = "Good"
+        missing_deduct, missing_label = 5, "Good"
     elif missing_pct < 15:
-        missing_deduct = 12
-        missing_label = "Moderate"
+        missing_deduct, missing_label = 12, "Moderate"
     else:
-        missing_deduct = 25
-        missing_label = "Poor"
+        missing_deduct, missing_label = 25, "Poor"
     score -= missing_deduct
     breakdown["Missing Values"] = {"label": missing_label, "deduction": missing_deduct, "detail": f"{missing_pct:.1f}% cells missing"}
 
     # Duplicates (up to -15)
     dup_pct = profile["duplicates"]["duplicate_rows"] / max(n_rows, 1) * 100
     if dup_pct == 0:
-        dup_deduct = 0
-        dup_label = "Excellent"
+        dup_deduct, dup_label = 0, "Excellent"
     elif dup_pct < 2:
-        dup_deduct = 5
-        dup_label = "Good"
+        dup_deduct, dup_label = 5, "Good"
     elif dup_pct < 10:
-        dup_deduct = 10
-        dup_label = "Moderate"
+        dup_deduct, dup_label = 10, "Moderate"
     else:
-        dup_deduct = 15
-        dup_label = "Poor"
+        dup_deduct, dup_label = 15, "Poor"
     score -= dup_deduct
     breakdown["Duplicates"] = {"label": dup_label, "deduction": dup_deduct, "detail": f"{profile['duplicates']['duplicate_rows']} duplicate rows"}
 
     # Outliers (up to -15)
     outlier_cols = len(profile["outliers"])
     if outlier_cols == 0:
-        out_deduct = 0
-        out_label = "Excellent"
+        out_deduct, out_label = 0, "Excellent"
     elif outlier_cols <= 2:
-        out_deduct = 5
-        out_label = "Good"
+        out_deduct, out_label = 5, "Good"
     elif outlier_cols <= 5:
-        out_deduct = 10
-        out_label = "Moderate"
+        out_deduct, out_label = 10, "Moderate"
     else:
-        out_deduct = 15
-        out_label = "Poor"
+        out_deduct, out_label = 15, "Poor"
     score -= out_deduct
     breakdown["Outliers"] = {"label": out_label, "deduction": out_deduct, "detail": f"{outlier_cols} columns with outliers"}
 
@@ -277,14 +292,11 @@ def _compute_health_score(df: pd.DataFrame, profile: Dict) -> Dict[str, Any]:
     flags = profile.get("quality_flags", {})
     quality_issues = len(flags.get("constant_cols", [])) + len(flags.get("type_mismatch_cols", []))
     if quality_issues == 0:
-        col_deduct = 0
-        col_label = "Excellent"
+        col_deduct, col_label = 0, "Excellent"
     elif quality_issues <= 2:
-        col_deduct = 5
-        col_label = "Good"
+        col_deduct, col_label = 5, "Good"
     else:
-        col_deduct = 15
-        col_label = "Poor"
+        col_deduct, col_label = 15, "Poor"
     score -= col_deduct
     breakdown["Column Quality"] = {"label": col_label, "deduction": col_deduct, "detail": f"{quality_issues} quality issues"}
 
@@ -293,14 +305,11 @@ def _compute_health_score(df: pd.DataFrame, profile: Dict) -> Dict[str, Any]:
     high_missing = len(flags.get("high_missing_cols", []))
     consistency_issues = high_card + high_missing
     if consistency_issues == 0:
-        cons_deduct = 0
-        cons_label = "Excellent"
+        cons_deduct, cons_label = 0, "Excellent"
     elif consistency_issues <= 2:
-        cons_deduct = 5
-        cons_label = "Good"
+        cons_deduct, cons_label = 5, "Good"
     else:
-        cons_deduct = 10
-        cons_label = "Moderate"
+        cons_deduct, cons_label = 10, "Moderate"
     score -= cons_deduct
     breakdown["Data Consistency"] = {"label": cons_label, "deduction": cons_deduct, "detail": f"{consistency_issues} consistency concerns"}
 
@@ -379,7 +388,7 @@ def assess_ml_readiness(df: pd.DataFrame, profile: Dict, target_col: str = None)
     elif n_rows < 1000:
         assessment["sample_size"] = {"score": 60, "label": "Borderline", "detail": f"{n_rows} rows — 1,000+ preferred for robust ML"}
     elif n_rows < 10000:
-        assessment["sample_size"] = {"score": 80, "label": "Adequate", "detail": f"{n_rows} rows — good for most algorithms"}
+        assessment["sample_size"] = {"score": 80, "label": "Adequate", "detail": f"{n_rows:,} rows — good for most algorithms"}
     else:
         assessment["sample_size"] = {"score": 100, "label": "Strong", "detail": f"{n_rows:,} rows — ample training data"}
 
@@ -394,7 +403,7 @@ def assess_ml_readiness(df: pd.DataFrame, profile: Dict, target_col: str = None)
     else:
         assessment["missing_values"] = {"score": 40, "label": "High", "detail": f"{missing_pct:.1f}% missing — may degrade model quality"}
 
-    # Class imbalance (classification only)
+    # Class imbalance (classification only) / skew (regression)
     if target_col and target_col in df.columns:
         is_classif = df[target_col].nunique() <= 20 or not pd.api.types.is_numeric_dtype(df[target_col])
         if is_classif:
@@ -407,7 +416,6 @@ def assess_ml_readiness(df: pd.DataFrame, profile: Dict, target_col: str = None)
             else:
                 assessment["class_balance"] = {"score": 40, "label": "Imbalanced", "detail": f"Minority class: {min_class*100:.1f}% — SMOTE or class weights needed"}
         else:
-            # Regression target: check for distribution skew instead
             try:
                 skew = abs(float(df[target_col].skew()))
                 if skew < 1:
@@ -455,7 +463,7 @@ def detect_leakage(df: pd.DataFrame, profile: Dict, target_col: str = None) -> L
                 "severity": "High",
                 "message": f"'{col}' may contain future information that leaks the target variable.",
             })
-        # High correlation with target (if provided)
+        # High correlation with target
         if target_col and target_col in df.columns and target_col != col:
             try:
                 target_numeric = pd.to_numeric(df[target_col], errors="coerce")
@@ -475,6 +483,64 @@ def detect_leakage(df: pd.DataFrame, profile: Dict, target_col: str = None) -> L
     return warnings_list
 
 
+def detect_cross_column_anomalies(df: pd.DataFrame) -> List[Dict[str, Any]]:
+    """Detect cross-column logical inconsistencies."""
+    anomalies = []
+    cols_lower = {c.lower(): c for c in df.columns}
+
+    # Bath > bedrooms + 2 (housing data)
+    bath_col = next((cols_lower[c] for c in cols_lower if c in ("bath", "bathrooms", "bathroom")), None)
+    size_col = next((cols_lower[c] for c in cols_lower if c in ("size", "bhk", "bedrooms", "bedroom")), None)
+    if bath_col and size_col:
+        try:
+            bhk_num = df[size_col].astype(str).str.extract(r"(\d+)").astype(float).iloc[:, 0]
+            bath_num = pd.to_numeric(df[bath_col], errors="coerce")
+            bad = int((bath_num > bhk_num + 2).sum())
+            if bad > 0:
+                anomalies.append({
+                    "columns": [bath_col, size_col],
+                    "type": "Cross-Column Anomaly",
+                    "severity": "Medium",
+                    "message": f"{bad} rows where '{bath_col}' > bedrooms+2 — likely data entry errors.",
+                    "count": bad,
+                })
+        except Exception:
+            pass
+
+    # Price per sqft sanity check
+    price_col = next((cols_lower[c] for c in cols_lower if "price" in c), None)
+    sqft_col = next((cols_lower[c] for c in cols_lower if any(k in c for k in ("sqft", "area", "sq_ft"))), None)
+    if price_col and sqft_col:
+        try:
+            price_num = pd.to_numeric(df[price_col], errors="coerce")
+            sqft_num = pd.to_numeric(df[sqft_col], errors="coerce")
+            valid = price_num.notna() & sqft_num.notna() & (sqft_num > 0)
+            if valid.sum() > 10:
+                ppsf = (price_num[valid] / sqft_num[valid]) * 100000  # to rupees per sqft
+                extreme_low = int((ppsf < 100).sum())
+                extreme_high = int((ppsf > 100000).sum())
+                if extreme_low > 0:
+                    anomalies.append({
+                        "columns": [price_col, sqft_col],
+                        "type": "Price Sanity Check",
+                        "severity": "High",
+                        "message": f"{extreme_low} rows with price/sqft < ₹100 — possible unit mismatch or data error.",
+                        "count": extreme_low,
+                    })
+                if extreme_high > 0:
+                    anomalies.append({
+                        "columns": [price_col, sqft_col],
+                        "type": "Price Sanity Check",
+                        "severity": "Medium",
+                        "message": f"{extreme_high} rows with price/sqft > ₹1,00,000 — verify these aren't outliers.",
+                        "count": extreme_high,
+                    })
+        except Exception:
+            pass
+
+    return anomalies
+
+
 def compute_feature_importance(df: pd.DataFrame, target_col: str) -> List[Dict[str, Any]]:
     """Feature importance using correlation and mutual information heuristics."""
     from sklearn.feature_selection import mutual_info_classif, mutual_info_regression
@@ -491,14 +557,12 @@ def compute_feature_importance(df: pd.DataFrame, target_col: str) -> List[Dict[s
     X = df[numeric_cols].copy()
     y = df[target_col].copy()
 
-    # Fill missing values for computation
     X = X.fillna(X.median())
     y_encoded = y.copy()
     if y.dtype == object or str(y.dtype) == "category":
         le = LabelEncoder()
         y_encoded = pd.Series(le.fit_transform(y.astype(str).fillna("missing")))
 
-    # Determine task type
     is_classification = y.nunique() <= 20 or y.dtype == object
 
     try:
