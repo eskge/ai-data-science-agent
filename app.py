@@ -1,14 +1,34 @@
 """
 AI Data Science Agent
-Built with Streamlit + Groq API
-Architecture: LLM = planner | Pandas = executor
+Built with Streamlit + Groq API (LLaMA 3.3 70B)
+
+Architecture:
+  LLM  = planner, analyst, explainer  (Groq API)
+  Code = executor, transformer         (Pandas / Scikit-learn)
+
+The LLM never touches data directly.
+All cleaning and transformations are deterministic and auditable.
+
+Steps:
+  1.  CSV Upload
+  2-3. Dataset Profiling & Health Score
+  4.  AI Dataset Summary
+  5-6. AI Cleaning Plan & Execution
+  7.  Automated EDA
+  8.  Auto Target Detection
+  9-11. ML Readiness · Leakage · Cross-Column Anomalies · Feature Importance
+  12. Model Recommendations
+  13. Senior Data Scientist Review
+  14. AI Data Chat
+  15-16. Download Centre
+
+Requires:
+  pip install streamlit pandas numpy scikit-learn plotly groq scipy
 """
 import streamlit as st
 import pandas as pd
 import numpy as np
 import json
-import io
-import time
 from typing import Optional
 
 # ─── Page config (must be first Streamlit call) ─────────────────────────────
@@ -22,12 +42,13 @@ st.set_page_config(
 # ─── Imports ────────────────────────────────────────────────────────────────
 from utils.profiler import (
     profile_dataset, detect_target_candidates,
-    assess_ml_readiness, detect_leakage, compute_feature_importance
+    assess_ml_readiness, detect_leakage, compute_feature_importance,
+    detect_cross_column_anomalies
 )
 from utils.cleaner import generate_cleaning_plan, execute_cleaning_plan
 from utils.charts import (
     plot_distribution, plot_categorical, plot_correlation_heatmap,
-    plot_missing_values, plot_health_breakdown, plot_target_distribution,
+    plot_missing_values, plot_target_distribution,
     plot_feature_importance, plot_scatter, plot_ml_readiness
 )
 from utils.reports import (
@@ -83,6 +104,8 @@ hr { border-color: var(--border) !important; margin: 1.5rem 0 !important; }
 </style>
 """, unsafe_allow_html=True)
 
+
+# ─── Session State ───────────────────────────────────────────────────────────
 def init_state():
     defaults = {
         "df_raw": None, "df_clean": None, "filename": None, "profile": None,
@@ -91,6 +114,7 @@ def init_state():
         "top_features": [], "ml_readiness": None, "leakage_warnings": [],
         "model_recs": None, "senior_review": None, "starter_code": None,
         "chat_history": [], "groq_client": None, "api_key": "",
+        "_cleaning_insight": None, "_client_key": None,
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -98,11 +122,19 @@ def init_state():
 
 init_state()
 
+
+# ─── UI helpers ─────────────────────────────────────────────────────────────
 def card(header, value, sub=""):
-    st.markdown(f'<div class="card"><div class="card-header">{header}</div><div class="card-value">{value}</div>{"<div class=card-sub>" + sub + "</div>" if sub else ""}</div>', unsafe_allow_html=True)
+    st.markdown(
+        f'<div class="card"><div class="card-header">{header}</div>'
+        f'<div class="card-value">{value}</div>'
+        f'{"<div class=card-sub>" + sub + "</div>" if sub else ""}</div>',
+        unsafe_allow_html=True,
+    )
 
 def insight(text):
-    st.markdown(f'<div class="insight-box">💡 {text}</div>', unsafe_allow_html=True)
+    if text:
+        st.markdown(f'<div class="insight-box">💡 {text}</div>', unsafe_allow_html=True)
 
 def warn(text):
     st.markdown(f'<div class="warn-box">⚠️ {text}</div>', unsafe_allow_html=True)
@@ -121,14 +153,16 @@ def risk_badge(risk):
     cls = {"Low": "risk-low", "Medium": "risk-med", "High": "risk-high"}.get(risk, "risk-low")
     return f'<span class="{cls}">● {risk} Risk</span>'
 
+
+# ─── Groq client ─────────────────────────────────────────────────────────────
 def get_client():
-    # Return cached client only if same key was used to build it
+    """Return validated Groq client. Validates key on first use; caches per key."""
     if st.session_state.groq_client and st.session_state.get("_client_key") == st.session_state.api_key:
         return st.session_state.groq_client
     if st.session_state.api_key:
         try:
             client = llm_module.get_client(st.session_state.api_key)
-            client.models.list()          # raises on bad key
+            client.models.list()  # raises 401 on bad key
             st.session_state.groq_client = client
             st.session_state["_client_key"] = st.session_state.api_key
             return client
@@ -143,21 +177,31 @@ def get_client():
             return None
     return None
 
+
 # ─── Sidebar ─────────────────────────────────────────────────────────────────
 with st.sidebar:
     st.markdown("### 🔬 DS Agent")
     st.markdown("---")
-    api_key = st.text_input("Groq API Key", value=st.session_state.api_key, type="password", placeholder="gsk_...", help="Get your key at console.groq.com")
+
+    api_key = st.text_input(
+        "Groq API Key", value=st.session_state.api_key,
+        type="password", placeholder="gsk_...",
+        help="Get your free key at console.groq.com",
+    )
     if api_key != st.session_state.api_key:
         st.session_state.api_key = api_key
         st.session_state.groq_client = None
+        st.session_state["_client_key"] = None
+
     if api_key and st.session_state.get("_client_key") == api_key:
         st.markdown('<div class="success-box" style="font-size:0.75rem;padding:0.5rem 0.8rem">✓ Groq connected</div>', unsafe_allow_html=True)
     elif api_key:
-        st.markdown('<div style="font-size:0.75rem;padding:0.5rem 0.8rem;color:var(--muted)">⏳ Key entered — will validate on next action</div>', unsafe_allow_html=True)
+        st.markdown('<div style="font-size:0.75rem;padding:0.5rem 0.8rem;color:var(--muted)">⏳ Key entered — validates on next action</div>', unsafe_allow_html=True)
     else:
         st.markdown('<div class="warn-box" style="font-size:0.75rem;padding:0.5rem 0.8rem">Enter Groq key for AI features</div>', unsafe_allow_html=True)
+
     st.markdown("---")
+
     if st.session_state.df_raw is not None:
         df_w = st.session_state.df_clean if st.session_state.df_clean is not None else st.session_state.df_raw
         st.markdown(f"📊 **{st.session_state.filename}**")
@@ -168,19 +212,28 @@ with st.sidebar:
             st.markdown(f"<small style='color:var(--accent)'>🎯 Target: {st.session_state.target_col}</small>", unsafe_allow_html=True)
         if st.session_state.task_type:
             st.markdown(f"<small style='color:var(--muted)'>{st.session_state.task_type}</small>", unsafe_allow_html=True)
-    st.markdown("---")
-    if st.session_state.df_raw is not None:
+        st.markdown("---")
         if st.button("🗑️ Reset / New Dataset", use_container_width=True):
             for _k in list(st.session_state.keys()):
                 del st.session_state[_k]
             st.rerun()
+
     st.markdown("<small style='color:var(--muted)'>LLM = planner & analyst<br>Pandas = executor<br>Deterministic & auditable</small>", unsafe_allow_html=True)
 
-# ─── Hero (no data) ───────────────────────────────────────────────────────────
-if st.session_state.df_raw is None:
-    st.markdown('<div class="hero"><div class="hero-title">🔬 AI Data Science Agent</div><div class="hero-sub">Upload a CSV to automatically profile, clean, visualise, and get ML recommendations — powered by Groq LLaMA 3.3.</div></div>', unsafe_allow_html=True)
 
-# ─── STEP 1: Upload ───────────────────────────────────────────────────────────
+# ─── Hero ────────────────────────────────────────────────────────────────────
+if st.session_state.df_raw is None:
+    st.markdown(
+        '<div class="hero"><div class="hero-title">🔬 AI Data Science Agent</div>'
+        '<div class="hero-sub">Upload a CSV to automatically profile, clean, visualise, '
+        'and get ML recommendations — powered by Groq LLaMA 3.3.</div></div>',
+        unsafe_allow_html=True,
+    )
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# STEP 1 — Upload
+# ═══════════════════════════════════════════════════════════════════════════════
 section("Step 1", "Upload Dataset")
 uploaded = st.file_uploader("Drop a CSV file here", type=["csv"], label_visibility="collapsed")
 
@@ -188,18 +241,28 @@ if uploaded is not None and (st.session_state.filename != uploaded.name or st.se
     with st.spinner("Reading file…"):
         try:
             try:
-                df = pd.read_csv(uploaded, encoding='utf-8')
+                df = pd.read_csv(uploaded, encoding="utf-8")
             except UnicodeDecodeError:
                 uploaded.seek(0)
-                df = pd.read_csv(uploaded, encoding='latin-1')
-            for key in ["df_raw","df_clean","profile","cleaning_plan","dataset_summary","target_col","task_type","model_recs","senior_review","starter_code","ml_readiness"]:
+                df = pd.read_csv(uploaded, encoding="latin-1")
+
+            # Reset all state for new file
+            reset_keys = [
+                "df_raw", "df_clean", "profile", "cleaning_plan", "dataset_summary",
+                "target_col", "task_type", "model_recs", "senior_review",
+                "starter_code", "ml_readiness", "_cleaning_insight",
+            ]
+            for key in reset_keys:
                 st.session_state[key] = None
             st.session_state["approved_steps"] = []
             st.session_state["cleaning_log"] = []
             st.session_state["top_features"] = []
             st.session_state["leakage_warnings"] = []
             st.session_state["chat_history"] = []
-            st.session_state["_cleaning_insight"] = None
+            # Clear EDA insight cache
+            for k in list(st.session_state.keys()):
+                if k.startswith("_eda_insight") or k.startswith("_cached_"):
+                    del st.session_state[k]
             st.session_state.df_raw = df
             st.session_state.filename = uploaded.name
         except Exception as e:
@@ -211,12 +274,13 @@ if st.session_state.df_raw is None:
 df_raw = st.session_state.df_raw
 df_work = st.session_state.df_clean if st.session_state.df_clean is not None else df_raw
 
+# Overview cards
 c1, c2, c3, c4 = st.columns(4)
 with c1: card("Rows", f"{len(df_work):,}", "records")
 with c2: card("Columns", str(df_work.shape[1]), "features")
 with c3: card("Memory", f"{df_work.memory_usage(deep=True).sum()/1024/1024:.1f} MB", "in memory")
 with c4:
-    mp = round(df_work.isna().sum().sum()/(df_work.shape[0]*df_work.shape[1])*100,1)
+    mp = round(df_work.isna().sum().sum() / (df_work.shape[0] * df_work.shape[1]) * 100, 1)
     card("Missing", f"{mp}%", "of all cells")
 
 with st.expander("📋 Data Preview", expanded=False):
@@ -225,7 +289,10 @@ with st.expander("📋 Data Preview", expanded=False):
 
 st.markdown("---")
 
-# ─── STEP 2–3: Profiling + Health ─────────────────────────────────────────────
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# STEP 2–3 — Profiling & Health Score
+# ═══════════════════════════════════════════════════════════════════════════════
 section("Step 2–3", "Dataset Profiling & Health Score")
 
 if st.session_state.profile is None:
@@ -240,16 +307,33 @@ label = "Excellent" if score >= 80 else "Good" if score >= 70 else "Fair" if sco
 
 col_l, col_r = st.columns([1, 2])
 with col_l:
-    st.markdown(f'<div class="card" style="text-align:center;border-color:{color}40"><div class="card-header">Dataset Health Score</div><div style="font-size:3.5rem;font-weight:800;color:{color};line-height:1.1">{score}</div><div style="font-size:2rem;color:{color};font-weight:300">/ 100</div><div style="color:var(--muted);font-size:0.85rem;margin-top:0.5rem">{label}</div></div>', unsafe_allow_html=True)
+    st.markdown(
+        f'<div class="card" style="text-align:center;border-color:{color}40">'
+        f'<div class="card-header">Dataset Health Score</div>'
+        f'<div style="font-size:3.5rem;font-weight:800;color:{color};line-height:1.1">{score}</div>'
+        f'<div style="font-size:2rem;color:{color};font-weight:300">/ 100</div>'
+        f'<div style="color:var(--muted);font-size:0.85rem;margin-top:0.5rem">{label}</div></div>',
+        unsafe_allow_html=True,
+    )
 
 with col_r:
     rows_html = ""
     for cat, info in health["breakdown"].items():
-        bc = {"Excellent":"#10b981","Good":"#06b6d4","Moderate":"#f59e0b","Poor":"#ef4444"}.get(info["label"],"#6366f1")
+        bc = {"Excellent": "#10b981", "Good": "#06b6d4", "Moderate": "#f59e0b", "Poor": "#ef4444"}.get(info["label"], "#6366f1")
         dt = f"-{info['deduction']}" if info["deduction"] > 0 else "✓"
-        rows_html += f'<div style="display:flex;justify-content:space-between;align-items:center;padding:0.4rem 0;border-bottom:1px solid var(--border)"><span style="font-size:0.85rem">{cat}</span><span style="display:flex;gap:0.75rem;align-items:center"><span style="font-size:0.75rem;color:{bc};font-weight:600">{info["label"]}</span><span style="font-size:0.75rem;color:var(--muted)">{info["detail"]}</span><span style="font-size:0.75rem;color:{bc};font-weight:700;min-width:24px;text-align:right">{dt}</span></span></div>'
+        rows_html += (
+            f'<div style="display:flex;justify-content:space-between;align-items:center;'
+            f'padding:0.4rem 0;border-bottom:1px solid var(--border)">'
+            f'<span style="font-size:0.85rem">{cat}</span>'
+            f'<span style="display:flex;gap:0.75rem;align-items:center">'
+            f'<span style="font-size:0.75rem;color:{bc};font-weight:600">{info["label"]}</span>'
+            f'<span style="font-size:0.75rem;color:var(--muted)">{info["detail"]}</span>'
+            f'<span style="font-size:0.75rem;color:{bc};font-weight:700;min-width:24px;text-align:right">{dt}</span>'
+            f'</span></div>'
+        )
     st.markdown(f'<div class="card">{rows_html}</div>', unsafe_allow_html=True)
 
+# Column profiles expander
 with st.expander("🔍 Column Profiles", expanded=False):
     col_names = list(profile["columns"].keys())
     search_col = st.selectbox("Select column", col_names, key="col_select")
@@ -266,20 +350,36 @@ with st.expander("🔍 Column Profiles", expanded=False):
             with c2: st.metric("Std", info["std"])
             with c3: st.metric("Min", info["min"])
             with c4: st.metric("Max", info["max"])
+            if info.get("skewness") is not None:
+                st.caption(f"Skewness: {info['skewness']}")
             st.plotly_chart(plot_distribution(df_work, search_col), use_container_width=True, key="pc_1")
-        elif info["col_type"] in ("categorical","high_cardinality_text","text"):
+        elif info["col_type"] in ("categorical", "high_cardinality_text", "text"):
             st.plotly_chart(plot_categorical(df_work, search_col), use_container_width=True, key="pc_2")
 
+# Missing values bar chart
 if any(i["missing_count"] > 0 for i in profile["columns"].values()):
     fig = plot_missing_values(profile)
-    if fig: st.plotly_chart(fig, use_container_width=True, key="pc_3")
+    if fig:
+        st.plotly_chart(fig, use_container_width=True, key="pc_3")
 
+# Outlier bounds detail
+if profile.get("outliers"):
+    with st.expander("📐 Outlier Bounds Detail", expanded=False):
+        for col_o, o_info in profile["outliers"].items():
+            lb, ub = o_info["lower_bound"], o_info["upper_bound"]
+            clamp_note = "  *(lower bound clamped to 0 — values are non-negative)*" if lb == 0.0 else ""
+            st.markdown(
+                f"**{col_o}**: {o_info['iqr_outliers']} outliers ({o_info['iqr_pct']}%)"
+                f" — IQR bounds: [{lb}, {ub}]{clamp_note}"
+            )
+
+# Quality flags
 flags = profile.get("quality_flags", {})
 if flags:
     st.markdown("**Quality Flags Detected**")
     for fn, fc in flags.items():
         if fc:
-            lbl = fn.replace("_"," ").title()
+            lbl = fn.replace("_", " ").title()
             if "constant" in fn or "mismatch" in fn:
                 danger_box(f"**{lbl}**: {', '.join(str(c) for c in fc)}")
             elif "high_missing" in fn or "high_cardinality" in fn:
@@ -289,24 +389,39 @@ if flags:
 
 st.markdown("---")
 
-# ─── STEP 4: AI Summary ───────────────────────────────────────────────────────
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# STEP 4 — AI Dataset Summary
+# ═══════════════════════════════════════════════════════════════════════════════
 section("Step 4", "AI Dataset Summary")
 client = get_client()
 
 if client:
     if st.session_state.dataset_summary is None:
         with st.spinner("Generating AI summary…"):
-            st.session_state.dataset_summary = llm_module.generate_dataset_summary(client, profile, df_work.head(5).to_string())
+            st.session_state.dataset_summary = llm_module.generate_dataset_summary(
+                client, profile, df_work.head(5).to_string()
+            )
     if st.session_state.dataset_summary:
-        st.markdown(f'<div class="insight-box" style="font-size:0.95rem;line-height:1.8">{st.session_state.dataset_summary}</div>', unsafe_allow_html=True)
+        st.markdown(
+            f'<div class="insight-box" style="font-size:0.95rem;line-height:1.8">'
+            f'{st.session_state.dataset_summary}</div>',
+            unsafe_allow_html=True,
+        )
 else:
     warn("Enter a Groq API key in the sidebar to enable AI summaries.")
     n_miss = sum(1 for c in profile["columns"].values() if c["missing_count"] > 0)
-    insight(f"Dataset has **{len(df_work):,} rows** and **{df_work.shape[1]} columns**. **{n_miss}** columns contain missing values. Health score: **{health['score']}/100**.")
+    insight(
+        f"Dataset has **{len(df_work):,} rows** and **{df_work.shape[1]} columns**. "
+        f"**{n_miss}** columns contain missing values. Health score: **{health['score']}/100**."
+    )
 
 st.markdown("---")
 
-# ─── STEP 5–6: Cleaning Plan ──────────────────────────────────────────────────
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# STEP 5–6 — Cleaning Plan & Execution
+# ═══════════════════════════════════════════════════════════════════════════════
 section("Step 5–6", "AI Cleaning Plan & Execution")
 
 if st.session_state.cleaning_plan is None:
@@ -317,12 +432,12 @@ plan = st.session_state.cleaning_plan
 if not plan:
     success_box("No cleaning steps needed — your dataset looks clean!")
 else:
+    # LLM cleaning insight (cached)
     if client:
-        if "_cleaning_insight" not in st.session_state or st.session_state._cleaning_insight is None:
+        if not st.session_state._cleaning_insight:
             with st.spinner("Analysing cleaning strategy…"):
                 st.session_state._cleaning_insight = llm_module.generate_cleaning_insights(client, plan, profile)
-        if st.session_state._cleaning_insight:
-            insight(st.session_state._cleaning_insight)
+        insight(st.session_state._cleaning_insight)
 
     st.markdown(f"**{len(plan)} cleaning actions proposed.** Review and approve below.")
     cb1, cb2, _ = st.columns([1, 1, 3])
@@ -339,9 +454,17 @@ else:
     for step in plan:
         approved = step["id"] in approved_ids
         border = "var(--success)" if approved else "var(--border)"
-        st.markdown(f'<div class="card" style="margin-bottom:0.6rem;border-color:{border}40"><div style="display:flex;justify-content:space-between;align-items:flex-start"><div><span style="font-size:0.9rem;font-weight:600">{step["title"]}</span><div style="font-size:0.78rem;color:var(--muted);margin-top:0.3rem">{step["reason"]}</div><div style="font-size:0.76rem;color:var(--muted);margin-top:0.15rem">Impact: {step["impact"]}</div></div><div style="text-align:right;min-width:80px">{risk_badge(step["risk"])}</div></div></div>', unsafe_allow_html=True)
-        toggle = st.checkbox("Approve", value=approved, key=f"step_{step['id']}")
-        if toggle:
+        st.markdown(
+            f'<div class="card" style="margin-bottom:0.6rem;border-color:{border}40">'
+            f'<div style="display:flex;justify-content:space-between;align-items:flex-start">'
+            f'<div><span style="font-size:0.9rem;font-weight:600">{step["title"]}</span>'
+            f'<div style="font-size:0.78rem;color:var(--muted);margin-top:0.3rem">{step["reason"]}</div>'
+            f'<div style="font-size:0.76rem;color:var(--muted);margin-top:0.15rem">Impact: {step["impact"]}</div></div>'
+            f'<div style="text-align:right;min-width:80px">{risk_badge(step["risk"])}</div>'
+            f'</div></div>',
+            unsafe_allow_html=True,
+        )
+        if st.checkbox("Approve", value=approved, key=f"step_{step['id']}"):
             new_approved.append(step)
 
     st.session_state.approved_steps = new_approved
@@ -354,16 +477,20 @@ else:
                 st.session_state.df_clean = df_cleaned
                 st.session_state.cleaning_log = log
                 st.session_state.profile = profile_dataset(df_cleaned)
-                st.session_state.dataset_summary = None
-                st.session_state.cleaning_plan = None
-                st.session_state.approved_steps = []
-                st.session_state.top_features = []
-                st.session_state.model_recs = None
-                st.session_state.senior_review = None
-                st.session_state.ml_readiness = None
-                st.session_state.leakage_warnings = []
+                # Reset downstream state
+                for k in ["dataset_summary", "cleaning_plan", "model_recs", "senior_review",
+                          "ml_readiness", "_cleaning_insight", "_cached_quality_report", "_cached_eda_report"]:
+                    st.session_state[k] = None
+                st.session_state["approved_steps"] = []
+                st.session_state["top_features"] = []
+                st.session_state["leakage_warnings"] = []
+                # Clear EDA insight cache
+                for k in list(st.session_state.keys()):
+                    if k.startswith("_eda_insight"):
+                        del st.session_state[k]
                 st.rerun()
 
+# Cleaning log
 if st.session_state.cleaning_log:
     st.markdown("**Cleaning Log**")
     for entry in st.session_state.cleaning_log:
@@ -379,19 +506,29 @@ if st.session_state.cleaning_log:
         with c2:
             st.markdown("**After Cleaning**")
             after_miss = st.session_state.df_clean.isna().sum().sum()
-            st.metric("Rows", f"{len(st.session_state.df_clean):,}", delta=f"{len(st.session_state.df_clean)-len(df_raw)}")
+            st.metric("Rows", f"{len(st.session_state.df_clean):,}",
+                      delta=f"{len(st.session_state.df_clean) - len(df_raw)}")
             _miss_delta = after_miss - df_raw.isna().sum().sum()
-            st.metric("Missing cells", f"{after_miss:,}", delta=f"{_miss_delta:+,}", delta_color="inverse")
+            st.metric("Missing cells", f"{after_miss:,}",
+                      delta=f"{_miss_delta:+,}", delta_color="inverse")
 
 df_work = st.session_state.df_clean if st.session_state.df_clean is not None else df_raw
 st.markdown("---")
 
-# ─── STEP 7: EDA ──────────────────────────────────────────────────────────────
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# STEP 7 — Automated EDA
+# ═══════════════════════════════════════════════════════════════════════════════
 section("Step 7", "Automated Exploratory Data Analysis")
 
 eda_tabs = st.tabs(["📊 Distributions", "📦 Categorical", "🔥 Correlations", "🎯 Target Analysis"])
 numeric_cols = df_work.select_dtypes(include=[np.number]).columns.tolist()
-cat_cols = df_work.select_dtypes(include=["object","category"]).columns.tolist()
+cat_cols = df_work.select_dtypes(include=["object", "category"]).columns.tolist()
+# Include potential_datetime cols in categorical tab
+cat_cols = cat_cols + [
+    c for c in df_work.columns
+    if profile["columns"].get(c, {}).get("col_type") == "potential_datetime" and c not in cat_cols
+]
 
 with eda_tabs[0]:
     if numeric_cols:
@@ -403,13 +540,14 @@ with eda_tabs[0]:
                 if _eda_key not in st.session_state:
                     ci = profile["columns"].get(sel_num, {})
                     stats_s = f"mean={ci.get('mean')}, std={ci.get('std')}, skew={ci.get('skewness')}"
-                    st.session_state[_eda_key] = llm_module.generate_eda_insight(client, "histogram + box plot", sel_num, stats_s, st.session_state.target_col)
-                insight(st.session_state[_eda_key])
+                    st.session_state[_eda_key] = llm_module.generate_eda_insight(
+                        client, "histogram + box plot", sel_num, stats_s, st.session_state.target_col
+                    )
+                insight(st.session_state.get(_eda_key))
     else:
         warn("No numeric columns found.")
 
 with eda_tabs[1]:
-    cat_cols = cat_cols + [c for c in df_work.columns if profile["columns"].get(c, {}).get("col_type") == "potential_datetime" and c not in cat_cols]
     if cat_cols:
         sel_cat = st.selectbox("Select categorical column", cat_cols, key="eda_cat")
         if sel_cat:
@@ -419,8 +557,10 @@ with eda_tabs[1]:
                 if _eda_key not in st.session_state:
                     vc = df_work[sel_cat].value_counts()
                     stats_s = f"top values: {vc.head(3).to_dict()}, {df_work[sel_cat].nunique()} unique"
-                    st.session_state[_eda_key] = llm_module.generate_eda_insight(client, "bar chart", sel_cat, stats_s, st.session_state.target_col)
-                insight(st.session_state[_eda_key])
+                    st.session_state[_eda_key] = llm_module.generate_eda_insight(
+                        client, "bar chart", sel_cat, stats_s, st.session_state.target_col
+                    )
+                insight(st.session_state.get(_eda_key))
     else:
         warn("No categorical columns found.")
 
@@ -452,28 +592,48 @@ with eda_tabs[3]:
             if feat:
                 _sc_y = target if target in numeric_cols else feat
                 _sc_c = target if df_work[target].nunique() <= 10 else None
-                st.plotly_chart(plot_scatter(df_work, feat, _sc_y, _sc_c), use_container_width=True, key="pc_scatter_tgt")
+                st.plotly_chart(
+                    plot_scatter(df_work, feat, _sc_y, _sc_c),
+                    use_container_width=True, key="pc_scatter_tgt",
+                )
     else:
         warn("Select a target variable (Step 8) to enable target analysis.")
 
 st.markdown("---")
 
-# ─── STEP 8: Target Detection ─────────────────────────────────────────────────
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# STEP 8 — Auto Target Detection
+# ═══════════════════════════════════════════════════════════════════════════════
 section("Step 8", "Auto Target Detection")
 
 candidates = detect_target_candidates(df_work, profile)
 if candidates:
     st.markdown("**Detected potential target variables:**")
     for cand in candidates[:5]:
-        cc = "#10b981" if cand["confidence"]>=80 else "#f59e0b" if cand["confidence"]>=50 else "#94a3b8"
-        reasons_html = "".join([f'<span style="margin-left:0.5rem;font-size:0.72rem;color:var(--muted)">• {r}</span>' for r in cand["reasons"]])
-        st.markdown(f'<div class="card" style="margin-bottom:0.5rem"><div style="display:flex;justify-content:space-between;align-items:center"><div><span style="font-weight:600">{cand["column"]}</span><span style="margin-left:0.75rem;font-size:0.78rem;color:var(--muted)">{cand["task_type"]}</span>{reasons_html}</div><span style="font-size:0.82rem;font-weight:700;color:{cc}">{cand["confidence"]}% confidence</span></div></div>', unsafe_allow_html=True)
+        cc = "#10b981" if cand["confidence"] >= 80 else "#f59e0b" if cand["confidence"] >= 50 else "#94a3b8"
+        reasons_html = "".join([
+            f'<span style="margin-left:0.5rem;font-size:0.72rem;color:var(--muted)">• {r}</span>'
+            for r in cand["reasons"]
+        ])
+        st.markdown(
+            f'<div class="card" style="margin-bottom:0.5rem">'
+            f'<div style="display:flex;justify-content:space-between;align-items:center">'
+            f'<div><span style="font-weight:600">{cand["column"]}</span>'
+            f'<span style="margin-left:0.75rem;font-size:0.78rem;color:var(--muted)">{cand["task_type"]}</span>'
+            f'{reasons_html}</div>'
+            f'<span style="font-size:0.82rem;font-weight:700;color:{cc}">{cand["confidence"]}% confidence</span>'
+            f'</div></div>',
+            unsafe_allow_html=True,
+        )
 
 all_cols = ["(none)"] + list(df_work.columns)
 default_idx = 0
 if candidates:
-    try: default_idx = all_cols.index(candidates[0]["column"])
-    except ValueError: pass
+    try:
+        default_idx = all_cols.index(candidates[0]["column"])
+    except ValueError:
+        pass
 
 sel_target = st.selectbox("Select target variable", all_cols, index=default_idx, key="target_select")
 if sel_target != "(none)":
@@ -491,11 +651,16 @@ if sel_target != "(none)":
 
 st.markdown("---")
 
-# ─── STEP 9–11: ML Readiness, Leakage, Feature Importance ────────────────────
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# STEP 9–11 — ML Readiness · Leakage · Cross-Column Anomalies · Feature Importance
+# ═══════════════════════════════════════════════════════════════════════════════
 section("Step 9–11", "ML Readiness · Leakage Detection · Feature Importance")
 
 if st.session_state.target_col:
     target = st.session_state.target_col
+
+    # ML Readiness
     ml_readiness = assess_ml_readiness(df_work, profile, target)
     st.session_state.ml_readiness = ml_readiness
 
@@ -503,27 +668,54 @@ if st.session_state.target_col:
     with c1:
         st.markdown("**ML Readiness**")
         overall = ml_readiness.get("overall", 0)
-        oc = "#10b981" if overall>=80 else "#f59e0b" if overall>=60 else "#ef4444"
-        st.markdown(f'<div style="font-size:2rem;font-weight:700;color:{oc};margin-bottom:0.75rem">{overall}/100</div>', unsafe_allow_html=True)
+        oc = "#10b981" if overall >= 80 else "#f59e0b" if overall >= 60 else "#ef4444"
+        st.markdown(
+            f'<div style="font-size:2rem;font-weight:700;color:{oc};margin-bottom:0.75rem">{overall}/100</div>',
+            unsafe_allow_html=True,
+        )
         for k, v in ml_readiness.items():
-            if k == "overall": continue
-            bc = "#10b981" if v["score"]>=80 else "#f59e0b" if v["score"]>=60 else "#ef4444"
-            st.markdown(f'<div style="display:flex;justify-content:space-between;padding:0.35rem 0;border-bottom:1px solid var(--border)"><span style="font-size:0.82rem">{k.replace("_"," ").title()}</span><span style="font-size:0.78rem;color:{bc};font-weight:600">{v["label"]}</span></div>', unsafe_allow_html=True)
+            if k == "overall":
+                continue
+            bc = "#10b981" if v["score"] >= 80 else "#f59e0b" if v["score"] >= 60 else "#ef4444"
+            st.markdown(
+                f'<div style="display:flex;justify-content:space-between;padding:0.35rem 0;'
+                f'border-bottom:1px solid var(--border)">'
+                f'<span style="font-size:0.82rem">{k.replace("_"," ").title()}</span>'
+                f'<span style="font-size:0.78rem;color:{bc};font-weight:600">{v["label"]}</span></div>',
+                unsafe_allow_html=True,
+            )
             st.caption(v["detail"])
 
     with c2:
         st.plotly_chart(plot_ml_readiness(ml_readiness), use_container_width=True, key="pc_9")
 
+    # Leakage detection
     st.markdown("**Data Leakage Detection**")
     leakage = detect_leakage(df_work, profile, target)
     st.session_state.leakage_warnings = leakage
     if leakage:
         for w in leakage:
-            if w["severity"] == "High": danger_box(f"**{w['type']} — {w['column']}**: {w['message']}")
-            else: warn(f"**{w['type']} — {w['column']}**: {w['message']}")
+            if w["severity"] == "High":
+                danger_box(f"**{w['type']} — {w['column']}**: {w['message']}")
+            else:
+                warn(f"**{w['type']} — {w['column']}**: {w['message']}")
     else:
         success_box("No obvious data leakage detected.")
 
+    # Cross-column anomaly detection
+    st.markdown("**Cross-Column Anomaly Detection**")
+    cross_anomalies = detect_cross_column_anomalies(df_work)
+    if cross_anomalies:
+        for a in cross_anomalies:
+            cols_str = " & ".join(f"`{c}`" for c in a["columns"])
+            if a["severity"] == "High":
+                danger_box(f"**{a['type']}** ({cols_str}): {a['message']}")
+            else:
+                warn(f"**{a['type']}** ({cols_str}): {a['message']}")
+    else:
+        success_box("No cross-column anomalies detected.")
+
+    # Feature importance
     st.markdown("**Feature Importance Estimation**")
     if st.button("⚡ Compute Feature Importance", key="fi_btn"):
         with st.spinner("Computing (mutual information + correlation)…"):
@@ -531,16 +723,26 @@ if st.session_state.target_col:
 
     if st.session_state.top_features:
         fig_fi = plot_feature_importance(st.session_state.top_features)
-        if fig_fi: st.plotly_chart(fig_fi, use_container_width=True, key="pc_10")
+        if fig_fi:
+            st.plotly_chart(fig_fi, use_container_width=True, key="pc_10")
         if client:
-            top_names = [f["feature"] for f in st.session_state.top_features[:3]]
-            insight(llm_module.generate_eda_insight(client, "feature importance chart", ", ".join(top_names), f"top features: {top_names}", target))
+            _fi_key = f"_eda_insight_fi_{target}"
+            if _fi_key not in st.session_state:
+                top_names = [f["feature"] for f in st.session_state.top_features[:3]]
+                st.session_state[_fi_key] = llm_module.generate_eda_insight(
+                    client, "feature importance chart",
+                    ", ".join(top_names), f"top features: {top_names}", target,
+                )
+            insight(st.session_state.get(_fi_key))
 else:
     warn("Select a target variable (Step 8) to run ML readiness checks.")
 
 st.markdown("---")
 
-# ─── STEP 12: Model Recommendations ──────────────────────────────────────────
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# STEP 12 — Model Recommendations
+# ═══════════════════════════════════════════════════════════════════════════════
 section("Step 12", "Model Recommendations")
 
 if st.session_state.task_type and st.session_state.target_col:
@@ -551,22 +753,42 @@ if st.session_state.task_type and st.session_state.target_col:
                     top_names = [f["feature"] for f in st.session_state.top_features[:5]]
                     st.session_state.model_recs = llm_module.generate_model_recommendations(
                         client, st.session_state.task_type, len(df_work),
-                        df_work.shape[1], st.session_state.target_col, top_names)
+                        df_work.shape[1], st.session_state.target_col, top_names,
+                    )
         if st.session_state.model_recs:
             st.markdown(f'<div class="card">{st.session_state.model_recs}</div>', unsafe_allow_html=True)
     else:
         task = st.session_state.task_type
-        recs = [("Random Forest","Strong baseline, handles mixed data"),("XGBoost / LightGBM","Excellent tabular performance"),("Logistic/Linear Regression","Fast, interpretable baseline")] if "Classification" in task else [("Random Forest Regressor","Handles non-linearity well"),("XGBoost Regressor","Top tabular performance"),("Ridge Regression","Fast, interpretable")]
+        recs = (
+            [("Random Forest", "Strong baseline, handles mixed data"),
+             ("XGBoost / LightGBM", "Excellent tabular performance"),
+             ("Logistic Regression", "Fast, interpretable baseline")]
+            if "Classification" in task else
+            [("Random Forest Regressor", "Handles non-linearity well"),
+             ("XGBoost Regressor", "Top tabular performance"),
+             ("Ridge Regression", "Fast, interpretable")]
+        )
         for name, desc in recs:
-            st.markdown(f'<div class="card"><strong>{name}</strong><br><span style="color:var(--muted);font-size:0.85rem">{desc}</span></div>', unsafe_allow_html=True)
+            st.markdown(
+                f'<div class="card"><strong>{name}</strong><br>'
+                f'<span style="color:var(--muted);font-size:0.85rem">{desc}</span></div>',
+                unsafe_allow_html=True,
+            )
 else:
     warn("Select a target variable (Step 8) to get model recommendations.")
 
 st.markdown("---")
 
-# ─── STEP 13: Senior DS Review ────────────────────────────────────────────────
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# STEP 13 — Senior Data Scientist Review
+# ═══════════════════════════════════════════════════════════════════════════════
 section("Step 13", "Senior Data Scientist Review")
-st.markdown('<div style="font-size:0.8rem;color:var(--muted);margin-bottom:1rem">AI-powered review from the perspective of an experienced data scientist</div>', unsafe_allow_html=True)
+st.markdown(
+    '<div style="font-size:0.8rem;color:var(--muted);margin-bottom:1rem">'
+    'AI-powered review from the perspective of an experienced data scientist</div>',
+    unsafe_allow_html=True,
+)
 
 if client and st.session_state.target_col:
     if st.session_state.senior_review is None:
@@ -574,11 +796,17 @@ if client and st.session_state.target_col:
             with st.spinner("Thinking like a senior DS…"):
                 top_names = [f["feature"] for f in st.session_state.top_features[:8]]
                 st.session_state.senior_review = llm_module.generate_senior_review(
-                    client, profile, st.session_state.task_type or "Unknown",
+                    client, profile,
+                    st.session_state.task_type or "Unknown",
                     st.session_state.target_col, top_names,
-                    st.session_state.ml_readiness or {}, st.session_state.leakage_warnings or [])
+                    st.session_state.ml_readiness or {},
+                    st.session_state.leakage_warnings or [],
+                )
     if st.session_state.senior_review:
-        st.markdown(f'<div class="senior-review">{st.session_state.senior_review}</div>', unsafe_allow_html=True)
+        st.markdown(
+            f'<div class="senior-review">{st.session_state.senior_review}</div>',
+            unsafe_allow_html=True,
+        )
 elif not client:
     warn("Add a Groq API key to enable the Senior Data Scientist Review.")
 else:
@@ -586,7 +814,10 @@ else:
 
 st.markdown("---")
 
-# ─── STEP 14: AI Data Chat ────────────────────────────────────────────────────
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# STEP 14 — AI Data Chat
+# ═══════════════════════════════════════════════════════════════════════════════
 section("Step 14", "AI Data Chat")
 
 if client:
@@ -597,10 +828,15 @@ if client:
 
     if not st.session_state.chat_history:
         st.markdown("**Try asking:**")
-        suggestions = ["What factors most influence the target variable?","Which column has the most missing values?","Show the distribution of the target variable.","Are there strong correlations between features?"]
+        suggestions = [
+            "What factors most influence the target variable?",
+            "Which column has the most missing values?",
+            "Show the distribution of the target variable.",
+            "Are there strong correlations between features?",
+        ]
         sc1, sc2 = st.columns(2)
         for i, s in enumerate(suggestions):
-            with (sc1 if i%2==0 else sc2):
+            with (sc1 if i % 2 == 0 else sc2):
                 if st.button(s, key=f"sug_{i}"):
                     st.session_state._pending_chat = s
 
@@ -614,12 +850,14 @@ if client:
         with st.spinner("Thinking…"):
             df_info = f"Shape: {df_work.shape}, Target: {st.session_state.target_col}, Task: {st.session_state.task_type}"
             schema = df_work.dtypes.to_string() + "\n\n" + df_work.describe().to_string()
-            result = llm_module.chat_with_data(client, user_input, df_info, schema, st.session_state.chat_history[:-1])
+            result = llm_module.chat_with_data(
+                client, user_input, df_info, schema, st.session_state.chat_history[:-1]
+            )
             answer = result["answer"]
             if result.get("code"):
                 try:
                     local_ns = {"df": df_work.copy(), "pd": pd, "np": np}
-                    exec(result["code"], local_ns)
+                    exec(result["code"], local_ns)  # noqa: S102
                     cr = local_ns.get("result", None)
                     if cr is not None:
                         if isinstance(cr, (pd.DataFrame, pd.Series)):
@@ -640,38 +878,80 @@ else:
 
 st.markdown("---")
 
-# ─── STEP 15–16: Downloads ────────────────────────────────────────────────────
-section("Step 15–16", "Download Center")
 
-dl1, dl2, dl3, dl4 = st.columns(4)
+# ═══════════════════════════════════════════════════════════════════════════════
+# STEP 15–16 — Download Centre
+# ═══════════════════════════════════════════════════════════════════════════════
+section("Step 15–16", "Download Centre")
+
 df_export = st.session_state.df_clean if st.session_state.df_clean is not None else df_raw
 
+dl1, dl2, dl3, dl4 = st.columns(4)
+
 with dl1:
-    st.download_button("📥 Cleaned CSV", data=df_export.to_csv(index=False).encode(), file_name=f"cleaned_{st.session_state.filename}", mime="text/csv", use_container_width=True)
+    st.download_button(
+        "📥 Cleaned CSV",
+        data=df_export.to_csv(index=False).encode(),
+        file_name=f"cleaned_{st.session_state.filename}",
+        mime="text/csv",
+        use_container_width=True,
+    )
 
 with dl2:
     if "_cached_quality_report" not in st.session_state:
-        st.session_state["_cached_quality_report"] = generate_quality_report(profile, st.session_state.cleaning_log)
-    st.download_button("📋 Quality Report", data=st.session_state["_cached_quality_report"].encode(), file_name="quality_report.md", mime="text/markdown", use_container_width=True)
+        st.session_state["_cached_quality_report"] = generate_quality_report(
+            profile, st.session_state.cleaning_log
+        )
+    st.download_button(
+        "📋 Quality Report",
+        data=st.session_state["_cached_quality_report"].encode(),
+        file_name="quality_report.md",
+        mime="text/markdown",
+        use_container_width=True,
+    )
 
 with dl3:
     if "_cached_eda_report" not in st.session_state:
-        st.session_state["_cached_eda_report"] = generate_eda_report(profile, st.session_state.top_features, st.session_state.dataset_summary or "")
-    st.download_button("📊 EDA Report", data=st.session_state["_cached_eda_report"].encode(), file_name="eda_report.md", mime="text/markdown", use_container_width=True)
+        st.session_state["_cached_eda_report"] = generate_eda_report(
+            profile, st.session_state.top_features, st.session_state.dataset_summary or ""
+        )
+    st.download_button(
+        "📊 EDA Report",
+        data=st.session_state["_cached_eda_report"].encode(),
+        file_name="eda_report.md",
+        mime="text/markdown",
+        use_container_width=True,
+    )
 
 with dl4:
     ml_md = generate_ml_report(
-        st.session_state.task_type or "Unknown", st.session_state.target_col or "Unknown",
-        st.session_state.top_features or [], st.session_state.ml_readiness or {},
-        st.session_state.leakage_warnings or [], st.session_state.model_recs or "Not generated",
-        st.session_state.senior_review or "Not generated")
-    st.download_button("🤖 ML Report", data=ml_md.encode(), file_name="ml_report.md", mime="text/markdown", use_container_width=True)
+        st.session_state.task_type or "Unknown",
+        st.session_state.target_col or "Unknown",
+        st.session_state.top_features or [],
+        st.session_state.ml_readiness or {},
+        st.session_state.leakage_warnings or [],
+        st.session_state.model_recs or "Not generated",
+        st.session_state.senior_review or "Not generated",
+    )
+    st.download_button(
+        "🤖 ML Report",
+        data=ml_md.encode(),
+        file_name="ml_report.md",
+        mime="text/markdown",
+        use_container_width=True,
+    )
 
 dl5, dl6, dl7, dl8 = st.columns(4)
 
 with dl5:
     log_json = json.dumps(st.session_state.cleaning_log, indent=2, default=str)
-    st.download_button("🧹 Cleaning Log", data=log_json.encode(), file_name="cleaning_log.json", mime="application/json", use_container_width=True)
+    st.download_button(
+        "🧹 Cleaning Log",
+        data=log_json.encode(),
+        file_name="cleaning_log.json",
+        mime="application/json",
+        use_container_width=True,
+    )
 
 with dl6:
     if client and st.session_state.target_col:
@@ -682,32 +962,67 @@ with dl6:
                     st.session_state.starter_code = llm_module.generate_starter_code(
                         client, st.session_state.target_col,
                         st.session_state.task_type or "Classification",
-                        top_names, st.session_state.filename or "dataset.csv")
+                        top_names, st.session_state.filename or "dataset.csv",
+                    )
         if st.session_state.starter_code:
-            st.download_button("🐍 Starter .py", data=st.session_state.starter_code.encode(), file_name="ml_starter.py", mime="text/plain", use_container_width=True)
+            st.download_button(
+                "🐍 Starter .py",
+                data=st.session_state.starter_code.encode(),
+                file_name="ml_starter.py",
+                mime="text/plain",
+                use_container_width=True,
+            )
     else:
-        st.button("🐍 Starter .py", disabled=True, use_container_width=True, help="Set target + API key first")
+        st.button("🐍 Starter .py", disabled=True, use_container_width=True,
+                  help="Set target + API key first")
 
 with dl7:
     if st.session_state.target_col:
         nb = generate_jupyter_notebook(
-            st.session_state.filename or "dataset.csv", st.session_state.target_col,
+            st.session_state.filename or "dataset.csv",
+            st.session_state.target_col,
             st.session_state.task_type or "Classification",
-            st.session_state.top_features or [], st.session_state.starter_code or "")
-        st.download_button("📓 Notebook .ipynb", data=json.dumps(nb, indent=2).encode(), file_name="ds_agent_notebook.ipynb", mime="application/json", use_container_width=True)
+            st.session_state.top_features or [],
+            st.session_state.starter_code or "",
+        )
+        st.download_button(
+            "📓 Notebook .ipynb",
+            data=json.dumps(nb, indent=2).encode(),
+            file_name="ds_agent_notebook.ipynb",
+            mime="application/json",
+            use_container_width=True,
+        )
     else:
-        st.button("📓 Notebook", disabled=True, use_container_width=True, help="Select target first")
+        st.button("📓 Notebook", disabled=True, use_container_width=True,
+                  help="Select target first")
 
 with dl8:
-    full = {"filename": st.session_state.filename, "shape": profile["shape"], "health_score": health["score"],
-            "target_col": st.session_state.target_col, "task_type": st.session_state.task_type,
-            "top_features": st.session_state.top_features[:10] if st.session_state.top_features else [],
-            "leakage_warnings": st.session_state.leakage_warnings, "cleaning_steps": len(st.session_state.cleaning_log)}
-    st.download_button("📦 Analysis JSON", data=json.dumps(full, indent=2, default=str).encode(), file_name="full_analysis.json", mime="application/json", use_container_width=True)
+    full = {
+        "filename": st.session_state.filename,
+        "shape": profile["shape"],
+        "health_score": health["score"],
+        "target_col": st.session_state.target_col,
+        "task_type": st.session_state.task_type,
+        "top_features": st.session_state.top_features[:10] if st.session_state.top_features else [],
+        "leakage_warnings": st.session_state.leakage_warnings,
+        "cleaning_steps": len(st.session_state.cleaning_log),
+    }
+    st.download_button(
+        "📦 Analysis JSON",
+        data=json.dumps(full, indent=2, default=str).encode(),
+        file_name="full_analysis.json",
+        mime="application/json",
+        use_container_width=True,
+    )
 
 if st.session_state.starter_code:
     with st.expander("👁️ Preview Starter Code"):
         st.code(st.session_state.starter_code, language="python")
 
 st.markdown("---")
-st.markdown('<div style="text-align:center;color:var(--muted);font-size:0.75rem;padding:1rem 0">AI Data Science Agent · LLM = planner · Pandas = executor · Deterministic & auditable</div>', unsafe_allow_html=True)
+st.markdown(
+    '<div style="text-align:center;color:var(--muted);font-size:0.75rem;padding:1rem 0">'
+    'AI Data Science Agent · LLM = planner · Pandas = executor · Deterministic & auditable'
+    '</div>',
+    unsafe_allow_html=True,
+)
