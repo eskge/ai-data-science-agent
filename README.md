@@ -87,8 +87,7 @@ ds_agent/
 ### 1. Clone the repository
 
 ```bash
-git clone https://github.com/your-username/ai-ds-agent.git
-cd ai-ds-agent
+git clone https://github.com/eskge/ai-ds-agent.git
 ```
 
 ### 2. Install dependencies
